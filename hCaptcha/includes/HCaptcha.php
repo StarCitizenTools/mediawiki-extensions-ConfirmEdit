@@ -5,6 +5,7 @@ namespace MediaWiki\Extensions\ConfirmEdit\hCaptcha;
 use ApiBase;
 use CaptchaAuthenticationRequest;
 use ConfirmEditHooks;
+use ContentSecurityPolicy;
 use FormatJson;
 use Html;
 use MediaWiki\Auth\AuthenticationRequest;
@@ -20,7 +21,7 @@ class HCaptcha extends SimpleCaptcha {
 	// hcaptcha-create, hcaptcha-sendemail via getMessage()
 	protected static $messagePrefix = 'hcaptcha-';
 
-	private $error;
+	private $error = null;
 
 	/**
 	 * Get the captcha form.
@@ -28,14 +29,14 @@ class HCaptcha extends SimpleCaptcha {
 	 * @return array
 	 */
 	public function getFormInformation( $tabIndex = 1 ) {
-		global $wgHCaptchaSiteKey;
+		$siteKey = $this->getConfig( 'HCaptchaSiteKey' );
 
 		$output = Html::element( 'div', [
 			'class' => [
 				'h-captcha',
 				'mw-confirmedit-captcha-fail' => (bool)$this->error,
 			],
-			'data-sitekey' => $wgHCaptchaSiteKey
+			'data-sitekey' => $siteKey
 		] );
 
 		return [
@@ -51,6 +52,22 @@ class HCaptcha extends SimpleCaptcha {
 	 */
 	public static function getCSPUrls() {
 		return [ 'https://hcaptcha.com', 'https://*.hcaptcha.com' ];
+	}
+
+	/**
+	 * Adds the CSP policies necessary for the captcha module to work in a CSP enforced
+	 * setup.
+	 *
+	 * @param ContentSecurityPolicy $csp The CSP instance to add the policies to, usually
+	 * obtained from {@link OutputPage::getCSP()}
+	 */
+	public static function addCSPSources( ContentSecurityPolicy $csp ) {
+		foreach ( static::getCSPUrls() as $src ) {
+			// Since frame-src is not supported
+			$csp->addDefaultSrc( $src );
+			$csp->addScriptSrc( $src );
+			$csp->addStyleSrc( $src );
+		}
 	}
 
 	/**
@@ -74,7 +91,10 @@ class HCaptcha extends SimpleCaptcha {
 	 * @return array
 	 */
 	protected function getCaptchaParamsFromRequest( WebRequest $request ) {
-		$response = $request->getVal( 'h-captcha-response' );
+		$response = $request->getVal(
+			'h-captcha-response',
+			$request->getVal( 'captchaWord', $request->getVal( 'captchaword' ) )
+		);
 		return [ '', $response ];
 	}
 
@@ -89,14 +109,18 @@ class HCaptcha extends SimpleCaptcha {
 	 * @return bool
 	 */
 	protected function passCaptcha( $_, $token ) {
-		global $wgRequest, $wgHCaptchaSecretKey, $wgHCaptchaSendRemoteIP, $wgHCaptchaProxy;
+		global $wgRequest;
+
+		$secretKey = $this->getConfig( 'HCaptchaSecretKey' );
+		$sendRemoteIp = $this->getConfig( 'HCaptchaSendRemoteIP' );
+		$proxy = $this->getConfig( 'HCaptchaProxy' );
 
 		$url = 'https://hcaptcha.com/siteverify';
 		$data = [
-			'secret' => $wgHCaptchaSecretKey,
+			'secret' => $secretKey,
 			'response' => $token,
 		];
-		if ( $wgHCaptchaSendRemoteIP ) {
+		if ( $sendRemoteIp ) {
 			$data['remoteip'] = $wgRequest->getIP();
 		}
 
@@ -105,8 +129,8 @@ class HCaptcha extends SimpleCaptcha {
 			'postData' => $data,
 		];
 
-		if ( $wgHCaptchaProxy ) {
-			$options['proxy'] = $wgHCaptchaProxy;
+		if ( $proxy ) {
+			$options['proxy'] = $proxy;
 		}
 
 		$request = MediaWikiServices::getInstance()->getHttpRequestFactory()
@@ -137,17 +161,19 @@ class HCaptcha extends SimpleCaptcha {
 	 * @param array &$resultArr
 	 */
 	protected function addCaptchaAPI( &$resultArr ) {
+		$resultArr['captcha'] = $this->describeCaptchaType();
+		$resultArr['captcha']['error'] = $this->error;
 	}
 
 	/**
 	 * @return array
 	 */
 	public function describeCaptchaType() {
-		global $wgHCaptchaSiteKey;
+		$siteKey = $this->getConfig( 'HCaptchaSiteKey' );
 		return [
 			'type' => 'hcaptcha',
 			'mime' => 'application/javascript',
-			'key' => $wgHCaptchaSiteKey,
+			'key' => $siteKey,
 		];
 	}
 
@@ -187,6 +213,8 @@ class HCaptcha extends SimpleCaptcha {
 	 * @inheritDoc
 	 */
 	public function storeCaptcha( $info ) {
+		// hCaptcha is stored externally, the ID will be generated at that time as well, and
+		// the one returned here won't be used. Just pretend this worked.
 		return 'not used';
 	}
 
@@ -202,6 +230,7 @@ class HCaptcha extends SimpleCaptcha {
 	 * @inheritDoc
 	 */
 	public function getCaptcha() {
+		// hCaptcha is handled by frontend code + an external provider; nothing to do here.
 		return [];
 	}
 
@@ -221,7 +250,7 @@ class HCaptcha extends SimpleCaptcha {
 	public function onAuthChangeFormFields(
 		array $requests, array $fieldInfo, array &$formDescriptor, $action
 	) {
-		global $wgHCaptchaSiteKey;
+		$siteKey = $this->getConfig( 'HCaptchaSiteKey' );
 
 		$req = AuthenticationRequest::getRequestByClass(
 			$requests,
@@ -237,8 +266,20 @@ class HCaptcha extends SimpleCaptcha {
 
 		$formDescriptor['captchaWord'] = [
 			'class' => HTMLHCaptchaField::class,
-			'key' => $wgHCaptchaSiteKey,
+			'key' => $siteKey,
 			'error' => $captcha->getError(),
 		] + $formDescriptor['captchaWord'];
+	}
+
+	/**
+	 * Get value of the wg config
+	 *
+	 * @param string $name wg config name
+	 * @return string
+	 */
+	public function getConfig( $name ) {
+		$hCaptchaConfig = MediaWikiServices::getInstance()->getConfigFactory()
+			->makeConfig( 'hcaptcha' );
+		return $hCaptchaConfig->get( $name );
 	}
 }
